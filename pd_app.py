@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import re
@@ -14,7 +16,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide", initia
 
 st.markdown("""
 <style>
-.main .block-container { padding-top: 2rem; max-width: 1320px; }
+.main .block-container { padding-top: 2rem; max-width: 1360px; }
 .hero-card { padding: 1.35rem 1.5rem; border: 1px solid rgba(120,120,120,.18); border-radius: 22px; background: linear-gradient(135deg, rgba(120,120,255,.12), rgba(255,255,255,.03)); }
 .small-muted { color: #888; font-size: .92rem; }
 </style>
@@ -54,8 +56,26 @@ PD_BRAIN_SYSTEM = """
 반드시 JSON만 출력한다.
 """
 
+SHORTS_DOCTOR_SYSTEM = """
+너는 1분 숏폼 전문 작가이자 숏폼 리텐션 PD다.
+입력된 패키지의 one_minute_shorts만 냉정하게 갈아엎는다.
+카드뉴스식 설명, 발표자료식 문장, 추상적 화면, 약한 CTA를 모두 제거한다.
+
+반드시 지켜라.
+1. 0-3초 첫 문장은 강한 주장, 반전, 충격적 해석 중 하나여야 한다. 질문으로 시작해도 되지만 매우 날카로워야 한다.
+2. 7~9컷으로 구성한다. 각 컷은 앞 컷보다 더 구체적이어야 한다.
+3. 각 컷의 내레이션은 1~2문장, 구어체, 짧은 호흡으로 쓴다.
+4. '살펴보겠습니다', '중요합니다', '영향을 미칠 것입니다', '신중한 접근' 같은 말은 금지한다.
+5. visual은 아이콘/다이어그램이 아니라 실제 장면, 오브젝트, 인물, 화면, 사건으로 쓴다.
+6. edit_point에는 실제 편집자가 쓸 수 있는 줌, 컷인, 사운드, 자막 타이밍을 쓴다.
+7. image_prompt와 video_prompt에는 사용자가 선택한 image_ratio를 반영한다.
+8. video_prompt.english_prompt는 반드시 camera movement로 시작한다.
+9. 투자/건강/의학/법률 주제는 확정적 보장 표현을 피하고, 대신 시나리오/체크포인트로 말한다.
+10. 반드시 JSON만 출력한다.
+"""
+
 FINAL_SCHEMA = {
-    "auto_brief": {"topic":"", "target":"", "platform":"", "tone":"", "goal":"", "cta":"", "forbidden":[], "risk_notes":[]},
+    "auto_brief": {"topic":"", "target":"", "platform":"", "tone":"", "goal":"", "cta":"", "image_ratio":"", "forbidden":[], "risk_notes":[]},
     "pd_brain": {
         "real_intent":"", "viewer_desire":"", "viewer_anxiety":"", "conflict":"", "contrarian_claim":"", "comment_trigger":"",
         "fact_angle_bank":{"concrete_entities":[], "stakes":[], "tensions":[], "questions":[], "checkpoints":[], "needs_verification":[]},
@@ -104,7 +124,7 @@ def call_llm(system_prompt: str, user_prompt: str, model: str, temperature: floa
     )
     return extract_json(res.choices[0].message.content or "{}")
 
-def build_pd_prompt(reference_text: str, output_language: str, generation_scope: str, platform_hint: str, tone_hint: str, override_topic: str, card_count: int) -> str:
+def build_pd_prompt(reference_text: str, output_language: str, generation_scope: str, platform_hint: str, tone_hint: str, override_topic: str, card_count: int, image_ratio: str) -> str:
     return f"""
 아래 레퍼런스를 바탕으로 AI PD 사고루프를 실행하고 최종 제작 패키지를 만들어라.
 
@@ -115,16 +135,19 @@ def build_pd_prompt(reference_text: str, output_language: str, generation_scope:
 - 톤 힌트: {tone_hint}
 - 주제 덮어쓰기: {override_topic}
 - 카드뉴스 장수: {card_count}
+- 이미지/영상 비율: {image_ratio}
 
 강제 품질 기준:
 1. 자동 브리프에서 주제/타겟/목표/CTA/금지표현을 레퍼런스 기반으로 추론한다.
-2. pd_brain에 real_intent, viewer_desire, viewer_anxiety, conflict, contrarian_claim, comment_trigger를 반드시 채운다.
-3. fact_angle_bank에는 구체명사를 많이 넣는다. 단, 확인되지 않은 사실은 needs_verification에 넣는다.
-4. 1분 숏폼은 7~9컷으로 만들되, 각 컷은 정보 나열이 아니라 긴장 상승 구조여야 한다.
-5. 내레이션은 짧고 강하게. '살펴보겠습니다' 같은 발표 말투 금지.
-6. visual은 아이콘/다이어그램이 아니라 실제 장면으로 쓴다.
-7. 영상 프롬프트는 영어로 쓰고 반드시 카메라 무빙으로 시작한다.
-8. 마지막 quality 점수에서 85점 미만인 항목이 나오면 최종 결과를 스스로 한 번 재작성한 버전으로 출력한다.
+2. auto_brief.image_ratio에 반드시 {image_ratio}를 넣는다.
+3. pd_brain에 real_intent, viewer_desire, viewer_anxiety, conflict, contrarian_claim, comment_trigger를 반드시 채운다.
+4. fact_angle_bank에는 구체명사를 많이 넣는다. 단, 확인되지 않은 사실은 needs_verification에 넣는다.
+5. 1분 숏폼은 7~9컷으로 만들되, 각 컷은 정보 나열이 아니라 긴장 상승 구조여야 한다.
+6. 내레이션은 짧고 강하게. '살펴보겠습니다' 같은 발표 말투 금지.
+7. visual은 아이콘/다이어그램이 아니라 실제 장면으로 쓴다.
+8. image_prompt와 video_prompt에는 {image_ratio}에 맞는 composition을 반드시 포함한다.
+9. 영상 프롬프트는 영어로 쓰고 반드시 카메라 무빙으로 시작한다.
+10. 마지막 quality 점수에서 85점 미만인 항목이 나오면 최종 결과를 스스로 한 번 재작성한 버전으로 출력한다.
 
 출력 JSON 스키마 예시:
 {json.dumps(FINAL_SCHEMA, ensure_ascii=False, indent=2)}
@@ -133,12 +156,103 @@ def build_pd_prompt(reference_text: str, output_language: str, generation_scope:
 {reference_text}
 """
 
+def build_shorts_doctor_prompt(package: Dict[str, Any], image_ratio: str) -> str:
+    return f"""
+아래 패키지의 one_minute_shorts만 숏폼 전문 버전으로 재작성해라.
+나머지 카드뉴스, 제목, 해시태그 구조는 참고만 한다.
+
+이미지/영상 비율: {image_ratio}
+
+반환 JSON 형식:
+{{
+  "one_minute_shorts": {{
+    "title": "",
+    "core_claim": "",
+    "scenes": [
+      {{
+        "time": "0-3초",
+        "narration": "",
+        "caption": "",
+        "visual": "",
+        "edit_point": "",
+        "image_prompt": {{"korean_direction":"", "english_prompt":"", "negative_prompt":"text, watermark, logo"}},
+        "video_prompt": {{"korean_direction":"", "english_prompt":""}}
+      }}
+    ]
+  }},
+  "quality_patch": {{
+    "shorts_rewrite_reason": [],
+    "shorts_hook_score": 0,
+    "shorts_retention_score": 0,
+    "shorts_scene_score": 0
+  }}
+}}
+
+패키지:
+{json.dumps(package, ensure_ascii=False, indent=2)}
+"""
+
+def merge_shorts_doctor(package: Dict[str, Any], doctor_result: Dict[str, Any]) -> Dict[str, Any]:
+    if doctor_result.get("one_minute_shorts"):
+        package["one_minute_shorts"] = doctor_result["one_minute_shorts"]
+    quality = package.get("quality", {}) or {}
+    quality["shorts_doctor"] = doctor_result.get("quality_patch", {})
+    package["quality"] = quality
+    return package
+
 def stringify_output(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
+def to_csv(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v for k, v in row.items()})
+    return output.getvalue()
+
+def package_to_rows(package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    brief = package.get("auto_brief", {}) or {}
+    shorts = package.get("one_minute_shorts", {}) or {}
+    for idx, scene in enumerate(shorts.get("scenes", []) or [], 1):
+        rows.append({
+            "type": "shorts_scene",
+            "index": idx,
+            "title": shorts.get("title", ""),
+            "core_claim": shorts.get("core_claim", ""),
+            "time": scene.get("time", ""),
+            "headline_or_caption": scene.get("caption", ""),
+            "body_or_narration": scene.get("narration", ""),
+            "visual": scene.get("visual", ""),
+            "edit_point": scene.get("edit_point", ""),
+            "image_prompt": scene.get("image_prompt", {}),
+            "video_prompt": scene.get("video_prompt", {}),
+            "image_ratio": brief.get("image_ratio", ""),
+        })
+    for idx, card in enumerate(package.get("card_news", []) or [], 1):
+        rows.append({
+            "type": "card_news",
+            "index": card.get("page", idx),
+            "title": "",
+            "core_claim": "",
+            "time": "",
+            "headline_or_caption": card.get("headline", ""),
+            "body_or_narration": card.get("body", ""),
+            "visual": card.get("image_direction", ""),
+            "edit_point": card.get("design_mood", ""),
+            "image_prompt": card.get("image_prompt_en", ""),
+            "video_prompt": "",
+            "image_ratio": brief.get("image_ratio", ""),
+        })
+    return rows
+
 def render_auto_brief(auto_inputs: Dict[str, Any]) -> None:
     cols = st.columns(2)
-    for idx, key in enumerate(["topic","target","platform","tone","goal","cta"]):
+    for idx, key in enumerate(["topic","target","platform","tone","goal","cta","image_ratio"]):
         with cols[idx % 2]:
             st.markdown(f"**{key}**")
             st.write(auto_inputs.get(key, ""))
@@ -154,8 +268,8 @@ def render_scene_cards(scenes: List[Dict[str, Any]]) -> None:
             st.markdown(f"**자막**\n\n{scene.get('caption','')}")
             st.markdown(f"**화면**\n\n{scene.get('visual','')}")
             st.markdown(f"**편집 포인트**\n\n{scene.get('edit_point','')}")
-            st.text_area("이미지 프롬프트", stringify_output(scene.get("image_prompt", {})), height=170, key=f"image_{i}")
-            st.text_area("영상 프롬프트", stringify_output(scene.get("video_prompt", {})), height=170, key=f"video_{i}")
+            st.text_area("이미지 프롬프트", stringify_output(scene.get("image_prompt", {})), height=170, key=f"image_{i}_{id(scene)}")
+            st.text_area("영상 프롬프트", stringify_output(scene.get("video_prompt", {})), height=170, key=f"video_{i}_{id(scene)}")
 
 def render_card_news(cards: List[Dict[str, Any]]) -> None:
     for idx, card in enumerate(cards, 1):
@@ -165,19 +279,23 @@ def render_card_news(cards: List[Dict[str, Any]]) -> None:
             st.markdown(f"**디자인 톤**\n\n{card.get('design_mood','')}")
             st.markdown(f"**이미지 방향**\n\n{card.get('image_direction','')}")
             st.markdown(f"**강조 자막**\n\n{card.get('key_caption','')}")
-            st.text_area("이미지 프롬프트 EN", card.get("image_prompt_en", ""), height=120, key=f"card_{idx}")
+            st.text_area("이미지 프롬프트 EN", card.get("image_prompt_en", ""), height=120, key=f"card_{idx}_{id(card)}")
 
 if "package" not in st.session_state:
     st.session_state.package = None
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-st.markdown(f"""<div class='hero-card'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><p class='small-muted'>요약봇 말고 PD 사고회로. 약한 결과는 스스로 버리고 다시 쓰게 설계했습니다.</p></div>""", unsafe_allow_html=True)
+st.markdown(f"""<div class='hero-card'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><p class='small-muted'>요약봇 말고 PD 사고회로. 쇼츠는 별도 전문 리라이트를 거쳐 카드뉴스식 문장을 제거합니다.</p></div>""", unsafe_allow_html=True)
 
 st.sidebar.header("⚙️ 생성 설정")
 model = st.sidebar.selectbox("OpenAI 모델", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"], index=0)
 temperature = st.sidebar.slider("창의성", 0.1, 1.2, 0.85, 0.05)
 output_language = st.sidebar.selectbox("출력 언어", ["한국어", "영어", "한국어+영어"], index=0)
 generation_scope = st.sidebar.selectbox("생성 범위", ["숏폼+카드뉴스+이미지/영상 프롬프트", "숏폼 중심", "카드뉴스 중심", "이미지/영상 프롬프트 중심"], index=0)
+image_ratio = st.sidebar.selectbox("이미지/영상 비율", ["9:16 vertical shorts", "1:1 square card news", "4:5 Instagram feed", "16:9 YouTube wide", "3:4 portrait"], index=0)
 card_count = st.sidebar.slider("카드뉴스 장수", 5, 12, 7)
+run_shorts_doctor = st.sidebar.checkbox("쇼츠 대본 전문 리라이트 실행", value=True)
 with st.sidebar.expander("Streamlit Secrets 안내"):
     st.code('OPENAI_API_KEY = "sk-..."', language="toml")
 
@@ -198,10 +316,25 @@ if run_button:
     else:
         progress = st.progress(0)
         status = st.empty()
-        status.info("PD 사고루프 실행 중: 의도 분석 → 팩트 뱅크 → 후킹 전쟁실 → 장면화 → 재작성")
-        st.session_state.package = call_llm(PD_BRAIN_SYSTEM, build_pd_prompt(reference_text, output_language, generation_scope, platform_hint, tone_hint, override_topic, card_count), model, temperature)
+        status.info("1/2 PD 사고루프 실행 중: 의도 분석 → 팩트 뱅크 → 후킹 전쟁실 → 장면화")
+        package = call_llm(PD_BRAIN_SYSTEM, build_pd_prompt(reference_text, output_language, generation_scope, platform_hint, tone_hint, override_topic, card_count, image_ratio), model, temperature)
+        progress.progress(55)
+
+        if run_shorts_doctor:
+            status.info("2/2 쇼츠 대본 전문 리라이트 중: 카드뉴스식 문장 제거 → 리텐션 재설계")
+            doctor_result = call_llm(SHORTS_DOCTOR_SYSTEM, build_shorts_doctor_prompt(package, image_ratio), model, min(1.0, temperature + 0.05))
+            package = merge_shorts_doctor(package, doctor_result)
         progress.progress(100)
-        status.success("생성 완료. 자동 브리프와 PD 사고 흔적까지 확인하세요.")
+
+        if "auto_brief" not in package:
+            package["auto_brief"] = {}
+        package["auto_brief"]["image_ratio"] = image_ratio
+        package["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        package["reference_preview"] = reference_text[:240]
+        st.session_state.package = package
+        st.session_state.history.insert(0, package)
+        st.session_state.history = st.session_state.history[:20]
+        status.success("생성 완료. CSV 내보내기와 히스토리에서 다시 확인할 수 있습니다.")
 
 with right:
     st.subheader("2. 결과")
@@ -209,7 +342,7 @@ with right:
     if not package:
         st.info("레퍼런스를 입력하고 생성 버튼을 누르면 결과가 여기에 표시됩니다.")
     else:
-        tabs = st.tabs(["자동 브리프", "PD 사고회로", "숏폼 대본", "카드뉴스", "프롬프트", "제목/CTA", "검수", "전체 JSON"])
+        tabs = st.tabs(["자동 브리프", "PD 사고회로", "숏폼 대본", "카드뉴스", "프롬프트", "제목/CTA", "CSV/JSON", "히스토리"])
         with tabs[0]:
             render_auto_brief(package.get("auto_brief", {}))
         with tabs[1]:
@@ -238,9 +371,33 @@ with right:
             st.write(" ".join(package.get("hashtags", [])))
             st.markdown("### 제작 체크리스트")
             st.write(package.get("production_checklist", []))
-        with tabs[6]:
+            st.markdown("### 품질 점수")
             st.json(package.get("quality", {}))
+        with tabs[6]:
+            rows = package_to_rows(package)
+            csv_text = to_csv(rows)
+            json_text = stringify_output(package)
+            st.download_button("CSV 다운로드", csv_text, file_name="ai_pd_studio_content.csv", mime="text/csv", use_container_width=True)
+            st.download_button("JSON 다운로드", json_text, file_name="ai_pd_studio_output.json", mime="application/json", use_container_width=True)
+            st.text_area("CSV 미리보기", csv_text, height=280)
         with tabs[7]:
-            output_text = stringify_output(package)
-            st.download_button("JSON 다운로드", output_text, file_name="ai_pd_studio_output.json", mime="application/json", use_container_width=True)
-            st.text_area("전체 복사용 JSON", output_text, height=520)
+            if not st.session_state.history:
+                st.info("아직 히스토리가 없습니다.")
+            else:
+                labels = []
+                for idx, item in enumerate(st.session_state.history):
+                    brief = item.get("auto_brief", {}) or {}
+                    labels.append(f"{idx+1}. {item.get('generated_at','')} · {brief.get('topic','무제')}")
+                selected = st.selectbox("생성 히스토리", labels)
+                selected_idx = labels.index(selected)
+                selected_package = st.session_state.history[selected_idx]
+                st.json({
+                    "generated_at": selected_package.get("generated_at"),
+                    "auto_brief": selected_package.get("auto_brief", {}),
+                    "reference_preview": selected_package.get("reference_preview", ""),
+                })
+                history_csv = to_csv(package_to_rows(selected_package))
+                st.download_button("선택 히스토리 CSV 다운로드", history_csv, file_name="ai_pd_studio_history_item.csv", mime="text/csv", use_container_width=True)
+                if st.button("선택 히스토리를 현재 결과로 불러오기", use_container_width=True):
+                    st.session_state.package = selected_package
+                    st.rerun()
