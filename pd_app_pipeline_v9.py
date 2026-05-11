@@ -1,0 +1,740 @@
+import csv
+import io
+import json
+import os
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import streamlit as st
+from openai import OpenAI
+from supabase import Client, create_client
+
+APP_TITLE = "AI PD Studio V9"
+APP_SUBTITLE = "리서치 브리프 · 검증 출처 각주 · 카드뉴스 컨펌 후 제작 확장"
+TABLE_NAME = "content_history"
+HISTORY_LIMIT = 20
+
+GENERIC_PATTERNS = [
+    "노력만으로는 부족하다", "현실 판단이 답이다", "현실은 다르다", "반드시 필요하다", "성공은 어렵다",
+    "명확히 파악", "시간만 낭비", "극한의 노력이 결과 차이를 만든다", "댓글로", "경험도 공유",
+    "중요합니다", "살펴보겠습니다", "주목받고 있습니다", "성공 공식",
+]
+WEAK_HEADLINE_PATTERNS = [r"무엇이 더 중요", r"허와 실", r"착각에 빠졌다면", r"성공하려면", r"직접 밝힌", r"현실을 외면한다"]
+
+CARD_SCHEMA = {
+    "status": "draft",
+    "auto_brief": {"topic":"", "target":"", "platform":"", "tone":"", "goal":"", "cta":"", "image_ratio":"", "risk_notes":[]},
+    "research_brief": [],
+    "insight_board": {
+        "surface_topic":"", "central_insight":"", "anti_cliche":"", "tension":"", "so_what":"",
+        "proof_logic":"", "dangerous_reading":"", "sharp_reframe":"", "card_flow":[]
+    },
+    "card_news": [
+        {"page":1, "role":"hook", "headline":"", "body":"", "insight_device":"", "layout_hint":"", "source_refs":[], "source_display":""}
+    ],
+    "quality_gate": {},
+    "improvement_report": {},
+}
+
+EXPANSION_SCHEMA = {
+    "image_production": {"global_style_guide":"", "negative_prompt":"text, watermark, logo", "cards":[]},
+    "shorts": {"title":"", "core_claim":"", "scenes":[]},
+    "longform": {"title":"", "opening_hook":"", "script":"", "chapter_structure":[], "cta":""},
+    "titles": [], "thumbnail_copy": [], "hashtags": [], "production_checklist": []
+}
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide", initial_sidebar_state="expanded")
+st.markdown("""
+<style>
+.main .block-container { padding-top: 2rem; max-width: 1380px; }
+.hero-card { padding: 1.2rem 1.4rem; border: 1px solid rgba(120,120,120,.18); border-radius: 20px; background: linear-gradient(135deg, rgba(120,120,255,.12), rgba(255,255,255,.03)); }
+.warn-box { padding: 1rem 1.1rem; border: 1px solid rgba(255,80,80,.35); border-radius: 16px; background: rgba(255,80,80,.06); }
+.ok-box { padding: 1rem 1.1rem; border: 1px solid rgba(80,200,120,.35); border-radius: 16px; background: rgba(80,200,120,.06); }
+.small-muted { color: #888; font-size: .92rem; }
+</style>
+""", unsafe_allow_html=True)
+
+RESEARCH_SYSTEM = """
+너는 콘텐츠 제작 전 팩트체크 리서처다.
+목표는 카드뉴스 원고를 쓰기 전에, 카드에 각주로 쓸 수 있는 검증 가능한 출처 후보를 수집/정리하는 것이다.
+
+반드시 지켜라.
+- 확인되지 않은 출처를 confirmed로 표시하지 마라.
+- 직접 인용은 원문이 확인될 때만 direct_quote로 표시한다.
+- 검색/레퍼런스로 확인되지 않은 내용은 needs_verification으로 둔다.
+- 카드 하단 각주에 노출 가능한 것은 confirmed만이다.
+- inferred, needs_verification은 내부 메모로만 사용한다.
+- URL, 날짜, 출처명이 불확실하면 source_confidence를 needs_verification으로 둔다.
+
+반환 JSON:
+{
+  "research_summary":"",
+  "research_brief":[
+    {
+      "id":"S1",
+      "claim":"",
+      "source_title":"",
+      "source_name":"",
+      "source_url":"",
+      "source_date":"",
+      "source_context":"",
+      "quote_type":"direct_quote | paraphrase | background",
+      "source_confidence":"confirmed | inferred | needs_verification",
+      "usable_in_card":true,
+      "display_text":"출처: ...",
+      "verification_note":""
+    }
+  ],
+  "unverified_claims":[],
+  "research_warnings":[]
+}
+반드시 JSON만 출력한다.
+"""
+
+CARD_SYSTEM = """
+너는 카드뉴스 원고를 만드는 콘텐츠 PD다.
+카드뉴스 원고만 만들고, 이미지/영상/쇼츠/롱폼은 만들지 마라.
+
+규칙:
+- headline은 정보 제목이 아니라 주장형 문장이어야 한다.
+- body는 설명문이 아니라 짧은 논리여야 한다.
+- 저장문장, 저장포인트, save_point, save_line 필드는 만들지 마라.
+- insight_device는 이 장의 설득 장치다. 예: 실제 인용 뒤집기, 착각 파괴, 숫자 비교, 실패 사례, 조건문, 자기검증 질문.
+- layout_hint는 추후 이미지화할 때 필요한 시각 연출 메모다. 예: 실제 사진 강조, 비교형 인포그래픽, 빈 화면+한 문장, 대시보드, 노트, 타임라인.
+- source_refs에는 research_brief의 confirmed 출처 id만 넣어라.
+- inferred 또는 needs_verification 출처는 카드 source_refs에 넣지 마라.
+- source_display는 카드 하단에 작게 들어갈 각주 문구다. confirmed 출처가 없으면 빈 문자열로 둔다.
+- 마지막 장은 댓글 구걸 금지. 자기검증 질문으로 끝낸다.
+- 뻔한 말 금지: 노력만으로는 부족하다, 현실 판단이 답이다, 현실은 다르다, 성공하려면 냉철해야 한다, 극한의 노력이 결과 차이를 만든다.
+
+반드시 JSON만 출력한다.
+"""
+
+AUDIT_SYSTEM = """
+너는 업로드 전 하드게이트 심사위원이다. 절대 후하게 평가하지 마라.
+모든 score는 0~100 사이의 정수로 출력한다. 10점 만점 금지.
+점수는 1점 단위로 디테일하게 매긴다. 예: 43, 58, 67, 74, 81, 86, 92.
+85점 미만이면 업로드 가능으로 판정하지 않는다.
+
+평가 기준:
+- insight_score: 새 판단 기준과 해석이 있는가
+- copy_score: 문장이 저장/공유 가치가 있는가
+- logic_score: 메시지가 충돌하지 않는가
+- authority_score: 권위자를 써도 받아쓰기로 끝나지 않는가
+- source_integrity_score: 출처/날짜/맥락을 정확히 다루는가
+- risk_score: 과로 미화/성공팔이/검증 안 된 단정 위험이 낮은가
+- generic_score: 뻔한 문장 비율. 낮을수록 좋다
+- upload_ready_score: 카드뉴스 텍스트만 놓고 바로 업로드 가능한가
+
+중요:
+- source_refs에 confirmed가 아닌 출처가 들어갔으면 업로드 가능 불가.
+- 출처 없는 직접 인용문이 있으면 업로드 가능 불가.
+- verified source 없이 'X에서 말했다', '인터뷰에서 말했다' 같은 각주를 만들면 source_integrity_score를 40 이하로 줘라.
+
+반환 JSON:
+{"verdict":"업로드 가능 | 수정 필요 | 폐기 후 재작성", "scores":{"insight_score":0,"copy_score":0,"logic_score":0,"authority_score":0,"source_integrity_score":0,"risk_score":0,"generic_score":0,"upload_ready_score":0}, "weak_lines":[{"line":"", "reason":"", "fix_direction":""}], "critical_issues":[], "rewrite_actions":[], "setting_recommendations":{"tone_hint":"", "angle_shift":"", "card_count":"", "structure_change":"", "opening_strategy":""}, "upgrade_brief":""}
+반드시 JSON만 출력한다.
+"""
+
+REWRITE_SYSTEM = """
+너는 업로드 불가 판정을 받은 카드뉴스를 업로드 가능 수준으로 재설계하는 리라이트 디렉터다.
+사용자 개선 방향이 있으면 최우선 반영한다.
+
+규칙:
+- 저장문장/save_point/save_line은 만들지 마라.
+- insight_device와 layout_hint는 반드시 유지한다.
+- confirmed 출처만 source_refs에 연결한다.
+- inferred/needs_verification 출처는 카드 각주에 노출하지 않는다.
+- 출처 없는 직접 인용은 쓰지 않는다.
+- 권위자 인용은 가능하지만 매 장마다 해석과 판단 기준이 있어야 한다.
+
+반환 JSON:
+{"revised_card_package": {}, "improvement_report": {"why_failed":"", "core_fix":"", "rewritten_strategy":"", "user_direction_reflected":"", "changed_lines":[{"before":"", "after":"", "reason":""}], "setting_recommendations":{"tone_hint":"", "angle_shift":"", "structure_change":""}}}
+반드시 JSON만 출력한다.
+"""
+
+EXPAND_SYSTEM = """
+너는 컨펌된 카드뉴스 원고를 제작물로 확장하는 콘텐츠 프로듀서다.
+승인된 card_news의 메시지를 기준으로 선택된 제작물만 만든다.
+image_production은 card_news의 insight_device와 layout_hint를 적극 활용해 카드별 이미지화 기준을 만든다.
+이미지 프롬프트는 영어, 영상 프롬프트는 영어이며 반드시 카메라 움직임으로 시작한다.
+카드뉴스 원고의 핵심 주장을 바꾸지 마라.
+반드시 JSON만 출력한다.
+"""
+
+@st.cache_resource(show_spinner=False)
+def get_openai_client_cached(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key)
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client_cached(url: str, key: str) -> Client:
+    return create_client(url, key)
+
+def get_secret(name: str) -> str:
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return value or os.getenv(name, "")
+
+def get_openai_client() -> OpenAI:
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OPENAI_API_KEY가 없습니다. Streamlit Secrets에 추가해주세요.")
+        st.stop()
+    return get_openai_client_cached(api_key)
+
+def get_supabase_client() -> Optional[Client]:
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret("SUPABASE_ANON_KEY")
+    if not url or not key:
+        return None
+    try:
+        return get_supabase_client_cached(url, key)
+    except Exception as exc:
+        st.warning(f"Supabase 연결 실패: {exc}")
+        return None
+
+def storage_mode() -> str:
+    return "Supabase DB" if get_supabase_client() else "연결 안 됨"
+
+def extract_json(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+def call_llm(system_prompt: str, user_prompt: str, model: str, temperature: float) -> Dict[str, Any]:
+    res = get_openai_client().chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        temperature=temperature,
+        response_format={"type": "json_object"},
+    )
+    return extract_json(res.choices[0].message.content or "{}")
+
+def call_web_research(query: str, model: str) -> Dict[str, Any]:
+    client = get_openai_client()
+    prompt = f"""
+다음 카드뉴스 레퍼런스/주제에 대해 웹 검색으로 검증 가능한 출처 후보를 찾아 research_brief JSON을 만들어라.
+직접 인용, 날짜, 출처 URL, 맥락이 확인되는 항목만 confirmed로 표시하라.
+불확실한 것은 needs_verification으로 둬라.
+
+대상:
+{query}
+"""
+    try:
+        res = client.responses.create(
+            model=model,
+            tools=[{"type": "web_search_preview"}],
+            input=[{"role": "system", "content": RESEARCH_SYSTEM}, {"role": "user", "content": prompt}],
+            text={"format": {"type": "json_object"}},
+        )
+        return extract_json(getattr(res, "output_text", "") or "{}")
+    except Exception as exc:
+        return {"research_summary":"웹 검색 실패", "research_brief":[], "unverified_claims":[], "research_warnings":[f"web_search_failed: {exc}"]}
+
+def normalize_scores(gate: Dict[str, Any]) -> Dict[str, Any]:
+    scores = gate.get("scores", {}) or {}
+    out = {}
+    for key, value in scores.items():
+        try:
+            out[key] = max(0, min(100, int(round(float(value)))))
+        except Exception:
+            out[key] = 0
+    gate["scores"] = out
+    return gate
+
+def clean_card_package(package: Dict[str, Any]) -> Dict[str, Any]:
+    for card in package.get("card_news", []) or []:
+        card.pop("save_point", None)
+        card.pop("save_line", None)
+        if "layout_type" in card and "layout_hint" not in card:
+            card["layout_hint"] = card.pop("layout_type")
+        card.setdefault("source_refs", [])
+        card.setdefault("source_display", "")
+    return package
+
+def confirmed_source_ids(package: Dict[str, Any]) -> set:
+    ids = set()
+    for item in package.get("research_brief", []) or []:
+        if item.get("source_confidence") == "confirmed" and item.get("usable_in_card") is True:
+            ids.add(item.get("id"))
+    return ids
+
+def all_card_text(package: Dict[str, Any]) -> str:
+    chunks = []
+    for card in package.get("card_news", []) or []:
+        chunks.extend([str(card.get("headline", "")), str(card.get("body", "")), str(card.get("source_display", ""))])
+    return "\n".join(chunks)
+
+def deterministic_quality_gate(package: Dict[str, Any]) -> Dict[str, Any]:
+    package = clean_card_package(package)
+    text = all_card_text(package)
+    weak_hits = []
+    for phrase in GENERIC_PATTERNS:
+        if phrase in text:
+            weak_hits.append({"line": phrase, "reason": "뻔한 자기계발식 문장입니다.", "fix_direction": "조건, 반전, 판단 기준이 들어간 문장으로 바꾸세요."})
+    for pattern in WEAK_HEADLINE_PATTERNS:
+        if re.search(pattern, text):
+            weak_hits.append({"line": pattern, "reason": "정보 요약형 헤드라인입니다.", "fix_direction": "주장형/반전형 헤드라인으로 바꾸세요."})
+    confirmed = confirmed_source_ids(package)
+    for card in package.get("card_news", []) or []:
+        if not str(card.get("insight_device", "")).strip():
+            weak_hits.append({"line": f"{card.get('page', '?')}장 insight_device 빈칸", "reason": "설득 장치가 비어 있습니다.", "fix_direction": "이 장의 카피가 왜 먹히는지 장치를 명시하세요."})
+        if not str(card.get("layout_hint", "")).strip():
+            weak_hits.append({"line": f"{card.get('page', '?')}장 layout_hint 빈칸", "reason": "이미지화 힌트가 비어 있습니다.", "fix_direction": "시각 연출 메모를 넣으세요."})
+        for ref in card.get("source_refs", []) or []:
+            if ref not in confirmed:
+                weak_hits.append({"line": f"{card.get('page', '?')}장 source_ref {ref}", "reason": "confirmed가 아닌 출처를 카드 각주로 사용했습니다.", "fix_direction": "confirmed 출처만 카드에 노출하세요."})
+    generic_score = min(100, len(weak_hits) * 18)
+    return {"generic_score": generic_score, "weak_hits": weak_hits}
+
+def merge_audit_with_local(audit: Dict[str, Any], package: Dict[str, Any]) -> Dict[str, Any]:
+    local = deterministic_quality_gate(package)
+    gate = normalize_scores(dict(audit or {}))
+    gate.setdefault("scores", {})
+    gate["scores"]["local_generic_score"] = local["generic_score"]
+    gate["local_weak_hits"] = local["weak_hits"]
+    if local["generic_score"] > 0:
+        gate["verdict"] = "수정 필요"
+        gate.setdefault("critical_issues", [])
+        gate["critical_issues"].append("로컬 하드게이트: 약한 카피, 누락 필드, 또는 미검증 출처 각주가 감지되었습니다.")
+    return gate
+
+def is_upload_ready(package: Dict[str, Any], min_score: int) -> bool:
+    gate = package.get("quality_gate", {}) or {}
+    scores = gate.get("scores", {}) or {}
+    if gate.get("verdict") != "업로드 가능":
+        return False
+    if scores.get("local_generic_score", 0) > 0:
+        return False
+    return int(scores.get("upload_ready_score", 0) or 0) >= min_score
+
+def build_research_prompt(reference_text: str, manual_sources: str, research_mode: str) -> str:
+    return f"""
+리서치 모드: {research_mode}
+사용자 제공 출처/링크/메모:
+{manual_sources}
+
+레퍼런스:
+{reference_text}
+"""
+
+def build_card_prompt(reference_text: str, research_data: Dict[str, Any], output_language: str, image_ratio: str, card_count: int, platform_hint: str, tone_hint: str, override_topic: str) -> str:
+    return f"""
+카드뉴스 원고를 만들어라.
+출력 언어={output_language}, 이미지 비율={image_ratio}, 카드뉴스 장수={card_count}, 플랫폼 힌트={platform_hint}, 톤 힌트={tone_hint}, 주제 덮어쓰기={override_topic}
+출력 스키마 예시:
+{json.dumps(CARD_SCHEMA, ensure_ascii=False, indent=2)}
+
+리서치 브리프:
+{json.dumps(research_data, ensure_ascii=False, indent=2)}
+
+레퍼런스:
+{reference_text}
+"""
+
+def build_audit_prompt(card_package: Dict[str, Any]) -> str:
+    return f"""
+아래 카드뉴스 원고를 심사하라.
+모든 score는 0~100 정수다. 10점 만점 금지. 1점 단위로 디테일하게 채점하라.
+카드뉴스 원고:
+{json.dumps(card_package, ensure_ascii=False, indent=2)}
+"""
+
+def build_rewrite_prompt(card_package: Dict[str, Any], audit: Dict[str, Any], min_score: int, attempt: int, user_direction: str = "") -> str:
+    return f"""
+아래 카드뉴스는 업로드 가능 기준을 통과하지 못했다.
+목표 점수: upload_ready_score {min_score} 이상.
+재작성 회차: {attempt}
+사용자 개선 방향:
+{user_direction or '없음'}
+
+기존 카드뉴스:
+{json.dumps(card_package, ensure_ascii=False, indent=2)}
+
+심사 결과:
+{json.dumps(audit, ensure_ascii=False, indent=2)}
+
+카드뉴스 원고만 다시 써라. 저장문장/save_point/save_line은 만들지 마라. confirmed 출처만 source_refs에 넣어라.
+"""
+
+def build_expand_prompt(approved_package: Dict[str, Any], options: Dict[str, Any]) -> str:
+    return f"""
+아래 컨펌된 카드뉴스 원고를 기준으로 선택된 제작물만 확장하라.
+확장 옵션:
+{json.dumps(options, ensure_ascii=False, indent=2)}
+반환 스키마 예시:
+{json.dumps(EXPANSION_SCHEMA, ensure_ascii=False, indent=2)}
+컨펌된 카드뉴스:
+{json.dumps(approved_package, ensure_ascii=False, indent=2)}
+"""
+
+def audit_and_improve(card_package: Dict[str, Any], model: str, min_score: int, max_rewrites: int, user_direction: str = "") -> Dict[str, Any]:
+    attempts = []
+    current = clean_card_package(card_package)
+    for attempt in range(0, max_rewrites + 1):
+        audit = call_llm(AUDIT_SYSTEM, build_audit_prompt(current), model, 0.15)
+        gate = merge_audit_with_local(audit, current)
+        current["quality_gate"] = gate
+        attempts.append({"attempt": attempt, "verdict": gate.get("verdict"), "scores": gate.get("scores", {}), "critical_issues": gate.get("critical_issues", [])})
+        if is_upload_ready(current, min_score):
+            current.setdefault("improvement_report", {})["attempts"] = attempts
+            return clean_card_package(current)
+        if attempt >= max_rewrites:
+            current.setdefault("improvement_report", {})["attempts"] = attempts
+            current["improvement_report"]["next_action"] = "자동 재작성 한도에 도달했습니다. 개선 방향 직접 입력 후 재작성하세요."
+            return clean_card_package(current)
+        rewrite = call_llm(REWRITE_SYSTEM, build_rewrite_prompt(current, gate, min_score, attempt + 1, user_direction), model, 0.35)
+        revised = rewrite.get("revised_card_package") if isinstance(rewrite.get("revised_card_package"), dict) else current
+        revised["improvement_report"] = rewrite.get("improvement_report", {})
+        revised["improvement_report"]["previous_gate"] = gate
+        current = clean_card_package(revised)
+    return clean_card_package(current)
+
+def stringify(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+def save_history_item(package: Dict[str, Any]) -> None:
+    supabase = get_supabase_client()
+    if not supabase:
+        st.warning("Supabase가 연결되지 않아 저장하지 못했습니다.")
+        return
+    package = clean_card_package(package)
+    brief = package.get("auto_brief", {}) or {}
+    gate = package.get("quality_gate", {}) or {}
+    status = package.get("status", "draft")
+    verdict = gate.get("verdict", "") if isinstance(gate, dict) else ""
+    payload = {"topic": brief.get("topic") or "무제", "verdict": f"{status} | {verdict}".strip(" |"), "reference_preview": package.get("reference_preview", ""), "image_ratio": brief.get("image_ratio", ""), "package": package}
+    try:
+        supabase.table(TABLE_NAME).insert(payload).execute()
+    except Exception as exc:
+        st.error(f"Supabase 저장 실패: {exc}")
+
+def load_history_meta(limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
+    supabase = get_supabase_client()
+    if not supabase:
+        return []
+    try:
+        res = supabase.table(TABLE_NAME).select("id, created_at, topic, verdict, reference_preview, image_ratio").order("created_at", desc=True).limit(limit).execute()
+        return res.data or []
+    except Exception as exc:
+        st.error(f"히스토리 목록 조회 실패: {exc}")
+        return []
+
+def load_history_package(row_id: str) -> Optional[Dict[str, Any]]:
+    supabase = get_supabase_client()
+    if not supabase:
+        return None
+    try:
+        res = supabase.table(TABLE_NAME).select("id, created_at, package").eq("id", row_id).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return None
+        package = rows[0].get("package") or {}
+        if isinstance(package, str):
+            package = json.loads(package)
+        package.setdefault("db_id", rows[0].get("id"))
+        package.setdefault("generated_at", rows[0].get("created_at"))
+        return clean_card_package(package)
+    except Exception as exc:
+        st.error(f"히스토리 상세 조회 실패: {exc}")
+        return None
+
+def delete_history_item(row_id: str) -> None:
+    supabase = get_supabase_client()
+    if supabase:
+        supabase.table(TABLE_NAME).delete().eq("id", row_id).execute()
+
+def package_to_rows(package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+    brief = package.get("auto_brief", {}) or {}
+    for card in package.get("card_news", []) or []:
+        rows.append({"type":"card_news", "index":card.get("page", ""), "headline":card.get("headline", ""), "body":card.get("body", ""), "role":card.get("role", ""), "insight_device":card.get("insight_device", ""), "layout_hint":card.get("layout_hint", ""), "source_display":card.get("source_display", ""), "prompt":"", "image_ratio":brief.get("image_ratio", "")})
+    expansion = package.get("expansion", {}) or {}
+    for item in (expansion.get("image_production", {}) or {}).get("cards", []) or []:
+        rows.append({"type":"image_prompt", "index":item.get("page", ""), "headline":"", "body":item.get("korean_direction", ""), "role":"", "insight_device":"", "layout_hint":item.get("layout_direction", ""), "source_display":"", "prompt":item.get("english_prompt", ""), "image_ratio":brief.get("image_ratio", "")})
+    shorts = expansion.get("shorts", {}) or {}
+    for idx, scene in enumerate(shorts.get("scenes", []) or [], 1):
+        rows.append({"type":"shorts_scene", "index":idx, "headline":scene.get("caption", ""), "body":scene.get("narration", ""), "role":scene.get("time", ""), "insight_device":"", "layout_hint":scene.get("visual", ""), "source_display":"", "prompt":stringify(scene.get("video_prompt", {})), "image_ratio":brief.get("image_ratio", "")})
+    longform = expansion.get("longform", {}) or {}
+    if longform:
+        rows.append({"type":"longform_script", "index":1, "headline":longform.get("title", ""), "body":longform.get("script", ""), "role":"longform", "insight_device":"", "layout_hint":"", "source_display":"", "prompt":"", "image_ratio":brief.get("image_ratio", "")})
+    return rows
+
+def to_csv(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+def render_research(research: Dict[str, Any]) -> None:
+    st.markdown(f"**리서치 요약**\n\n{research.get('research_summary','')}")
+    warnings = research.get("research_warnings", []) or []
+    if warnings:
+        st.warning(" / ".join(map(str, warnings)))
+    for item in research.get("research_brief", []) or []:
+        label = f"{item.get('id','')} · {item.get('source_confidence','')} · {item.get('source_name','')} · {item.get('source_date','')}"
+        with st.expander(label, expanded=False):
+            st.write("claim", item.get("claim", ""))
+            st.write("title", item.get("source_title", ""))
+            st.write("url", item.get("source_url", ""))
+            st.write("context", item.get("source_context", ""))
+            st.write("display", item.get("display_text", ""))
+            st.write("note", item.get("verification_note", ""))
+
+def render_expansion(expansion: Dict[str, Any]) -> None:
+    exp_tabs = st.tabs(["이미지화 기준", "쇼츠", "롱폼", "제목/썸네일"])
+    with exp_tabs[0]:
+        image_prod = expansion.get("image_production", {}) or {}
+        st.markdown(f"**Global Style Guide**\n\n{image_prod.get('global_style_guide','')}")
+        for item in image_prod.get("cards", []) or []:
+            with st.expander(f"카드 {item.get('page','')} 이미지 프롬프트", expanded=False):
+                st.markdown(f"**시각 목표**\n\n{item.get('visual_goal','')}")
+                st.markdown(f"**레이아웃 방향**\n\n{item.get('layout_direction','')}")
+                st.text_area("English Prompt", item.get("english_prompt", ""), height=130, key=f"img_prompt_{item.get('page','')}_{id(item)}")
+    with exp_tabs[1]:
+        shorts = expansion.get("shorts", {}) or {}
+        st.markdown(f"### {shorts.get('title','')}")
+        for i, scene in enumerate(shorts.get("scenes", []) or [], 1):
+            with st.expander(f"컷 {i} · {scene.get('time','')}", expanded=i <= 2):
+                st.markdown(f"**내레이션**\n\n{scene.get('narration','')}")
+                st.markdown(f"**자막**\n\n{scene.get('caption','')}")
+                st.markdown(f"**화면**\n\n{scene.get('visual','')}")
+                st.text_area("영상 프롬프트", stringify(scene.get("video_prompt", {})), height=120, key=f"scene_vid_{i}_{id(scene)}")
+    with exp_tabs[2]:
+        longform = expansion.get("longform", {}) or {}
+        st.text_area("롱폼 대본", longform.get("script", ""), height=420)
+    with exp_tabs[3]:
+        st.write("제목", expansion.get("titles", []))
+        st.write("썸네일", expansion.get("thumbnail_copy", []))
+        st.write("해시태그", " ".join(expansion.get("hashtags", [])))
+
+def render_card_package(package: Dict[str, Any], min_score: int) -> None:
+    gate = package.get("quality_gate", {}) or {}
+    scores = gate.get("scores", {}) or {}
+    verdict = gate.get("verdict", "")
+    status = package.get("status", "draft")
+    box_class = "ok-box" if is_upload_ready(package, min_score) else "warn-box"
+    st.markdown(f"<div class='{box_class}'><b>상태:</b> {status} &nbsp; <b>판정:</b> {verdict or '판정 없음'} &nbsp; <b>기준:</b> {min_score}/100</div>", unsafe_allow_html=True)
+    if verdict:
+        cols = st.columns(5)
+        for idx, key in enumerate(["insight_score", "copy_score", "source_integrity_score", "local_generic_score", "upload_ready_score"]):
+            with cols[idx]:
+                st.metric(key, scores.get(key, "-"))
+    tabs = st.tabs(["카드뉴스 원고", "리서치 브리프", "개선 리포트", "하드게이트", "확장 결과", "CSV/JSON"])
+    with tabs[0]:
+        for i, card in enumerate(package.get("card_news", []) or [], 1):
+            with st.expander(f"{card.get('page', i)}장 · {card.get('role','')} · {card.get('headline','')}", expanded=i <= 2):
+                st.markdown(f"**헤드라인**\n\n{card.get('headline','')}")
+                st.markdown(f"**본문**\n\n{card.get('body','')}")
+                st.markdown(f"**인사이트 장치**\n\n{card.get('insight_device','')}")
+                st.markdown(f"**레이아웃 힌트**\n\n{card.get('layout_hint','')}")
+                if card.get("source_display"):
+                    st.caption(card.get("source_display"))
+    with tabs[1]:
+        render_research({"research_summary": package.get("research_summary", ""), "research_brief": package.get("research_brief", []), "research_warnings": package.get("research_warnings", [])})
+    with tabs[2]:
+        st.json(package.get("improvement_report", {}))
+    with tabs[3]:
+        st.json(gate)
+    with tabs[4]:
+        expansion = package.get("expansion")
+        if not expansion:
+            st.info("카드뉴스 컨펌 후 제작 확장을 생성하면 여기에 표시됩니다.")
+        else:
+            render_expansion(expansion)
+    with tabs[5]:
+        csv_text = to_csv(package_to_rows(package))
+        st.download_button("CSV 다운로드", csv_text, file_name="ai_pd_studio_v9_content.csv", mime="text/csv", use_container_width=True)
+        st.download_button("JSON 다운로드", stringify(package), file_name="ai_pd_studio_v9_output.json", mime="application/json", use_container_width=True)
+
+def render_history() -> None:
+    st.subheader("히스토리")
+    limit = st.slider("불러올 목록 수", 5, 50, HISTORY_LIMIT, 5)
+    if st.button("히스토리 목록 새로고침", use_container_width=True) or "history_meta" not in st.session_state:
+        st.session_state.history_meta = load_history_meta(limit)
+    meta = st.session_state.history_meta
+    if not meta:
+        st.info("저장된 히스토리가 없거나 Supabase 연결이 없습니다.")
+        return
+    labels = [f"{i+1}. {row.get('created_at','')} · {row.get('verdict','')} · {row.get('topic','무제')}" for i, row in enumerate(meta)]
+    selected = st.selectbox("생성 히스토리", labels)
+    row = meta[labels.index(selected)]
+    st.json({k: row.get(k) for k in ["id", "created_at", "topic", "verdict", "image_ratio", "reference_preview"]})
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("상세 불러오기", use_container_width=True):
+            package = load_history_package(row.get("id"))
+            if package:
+                st.session_state.current_package = package
+                if package.get("status") in ["approved", "expanded"]:
+                    st.session_state.approved_package = package
+                st.success("상세를 불러왔습니다.")
+    with col2:
+        if st.button("DB에서 삭제", use_container_width=True):
+            delete_history_item(row.get("id"))
+            st.session_state.history_meta = load_history_meta(limit)
+            st.rerun()
+
+if "current_package" not in st.session_state:
+    st.session_state.current_package = None
+if "approved_package" not in st.session_state:
+    st.session_state.approved_package = None
+if "menu" not in st.session_state:
+    st.session_state.menu = "카드뉴스 기획"
+
+st.markdown(f"""<div class='hero-card'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p><p class='small-muted'>출처 각주는 LLM 생성이 아니라 리서치 브리프의 confirmed 출처만 연결합니다.</p></div>""", unsafe_allow_html=True)
+
+st.sidebar.header("메인 메뉴")
+menu = st.sidebar.radio("이동", ["카드뉴스 기획", "제작 확장", "히스토리"], key="menu")
+st.sidebar.header("⚙️ 공통 설정")
+model = st.sidebar.selectbox("OpenAI 모델", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"], index=0)
+research_model = st.sidebar.selectbox("리서치 모델", ["gpt-4.1", "gpt-4o"], index=0)
+temperature = st.sidebar.slider("창의성", 0.1, 1.2, 0.75, 0.05)
+output_language = st.sidebar.selectbox("출력 언어", ["한국어", "영어", "한국어+영어"], index=0)
+image_ratio = st.sidebar.selectbox("이미지 비율", ["1:1 square card news", "9:16 vertical shorts", "4:5 Instagram feed", "16:9 YouTube wide"], index=0)
+card_count = st.sidebar.slider("카드뉴스 장수", 5, 12, 8, 1)
+min_upload_score = st.sidebar.slider("업로드 가능 최소 점수", 0, 100, 85, 1)
+max_rewrites = st.sidebar.slider("자동 개선 재시도 횟수", 0, 3, 2, 1)
+research_mode = st.sidebar.selectbox("리서치 방식", ["웹 검색으로 출처 확인", "레퍼런스 내부 근거만 사용", "리서치 사용 안 함"], index=0)
+with st.sidebar.expander("Secrets 확인"):
+    st.code('OPENAI_API_KEY = "sk-..."\nSUPABASE_URL = "https://...supabase.co"\nSUPABASE_SERVICE_ROLE_KEY = "sb_secret_..."', language="toml")
+    st.caption(f"현재 저장 방식: {storage_mode()}")
+
+st.divider()
+
+if menu == "카드뉴스 기획":
+    left, right = st.columns([0.84, 1.16], gap="large")
+    with left:
+        st.subheader("Step 1. 리서치 + 카드뉴스 원고 생성")
+        reference_text = st.text_area("레퍼런스 텍스트 / CSV 내용 / 대본 / 카드뉴스 문구", height=280, placeholder="여기에 레퍼런스를 붙여넣으세요.")
+        manual_sources = st.text_area("사용자 제공 출처/링크/메모", height=90, placeholder="기사 링크, X 링크, 출처 메모가 있으면 붙여넣으세요. 웹 검색보다 우선 참고합니다.")
+        with st.expander("기획 설정"):
+            override_topic = st.text_input("주제 덮어쓰기", placeholder="비워두면 자동 추론")
+            platform_hint = st.selectbox("플랫폼 힌트", ["AI가 판단", "Instagram 카드뉴스", "YouTube Shorts", "Instagram Reels", "TikTok", "혼합"], index=0)
+            tone_hint = st.selectbox("톤 힌트", ["커뮤니티 인기글형", "전문가 정보형", "자극적 후킹형", "다큐멘터리형", "광고 카피형"], index=0)
+        run_button = st.button("리서치 후 카드뉴스 원고 생성", type="primary", use_container_width=True)
+
+        if st.session_state.current_package:
+            st.divider()
+            st.subheader("Step 2. 원고 개선/컨펌")
+            ready = is_upload_ready(st.session_state.current_package, min_upload_score)
+            if not ready:
+                st.warning("현재 원고는 업로드 가능 기준을 통과하지 못했습니다. 개선 방향을 직접 입력해 재작성할 수 있습니다.")
+            manual_direction = st.text_area("개선 방향 직접 입력", height=120, placeholder="예: 검증된 출처가 없는 인용은 각주로 빼지 말고, 인사이트 중심으로 다시 써.")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("자동 개선 다시 시도", use_container_width=True):
+                    with st.spinner("자동 개선 재시도 중"):
+                        improved = audit_and_improve(st.session_state.current_package, model, min_upload_score, max_rewrites, "")
+                        st.session_state.current_package = improved
+                        save_history_item(improved)
+                        st.rerun()
+            with col_b:
+                if st.button("내 개선 방향으로 재작성", use_container_width=True):
+                    with st.spinner("사용자 디렉션 반영 재작성 중"):
+                        improved = audit_and_improve(st.session_state.current_package, model, min_upload_score, max_rewrites, manual_direction)
+                        st.session_state.current_package = improved
+                        save_history_item(improved)
+                        st.rerun()
+            if st.button("이 카드뉴스 내용 컨펌", use_container_width=True, disabled=not ready):
+                approved = clean_card_package(dict(st.session_state.current_package))
+                approved["status"] = "approved"
+                approved["approved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state.approved_package = approved
+                st.session_state.current_package = approved
+                save_history_item(approved)
+                st.success("컨펌 완료. 이제 제작 확장 메뉴에서 이미지/쇼츠/롱폼을 만들 수 있습니다.")
+
+    if run_button:
+        if not reference_text.strip():
+            st.warning("레퍼런스를 먼저 입력해주세요.")
+        else:
+            progress = st.progress(0)
+            status = st.empty()
+            status.info("1/4 리서치 브리프 생성 중")
+            if research_mode == "웹 검색으로 출처 확인":
+                research_data = call_web_research(build_research_prompt(reference_text, manual_sources, research_mode), research_model)
+            elif research_mode == "레퍼런스 내부 근거만 사용":
+                research_data = call_llm(RESEARCH_SYSTEM, build_research_prompt(reference_text, manual_sources, research_mode), model, 0.1)
+            else:
+                research_data = {"research_summary":"리서치 사용 안 함", "research_brief":[], "unverified_claims":[], "research_warnings":[]}
+            progress.progress(25)
+            status.info("2/4 카드뉴스 원고 생성 중")
+            card_package = call_llm(CARD_SYSTEM, build_card_prompt(reference_text, research_data, output_language, image_ratio, card_count, platform_hint, tone_hint, override_topic), model, temperature)
+            card_package["research_summary"] = research_data.get("research_summary", "")
+            card_package["research_brief"] = research_data.get("research_brief", [])
+            card_package["research_warnings"] = research_data.get("research_warnings", [])
+            card_package["status"] = "draft"
+            progress.progress(50)
+            status.info("3/4 하드게이트 심사 및 자동 개선 중")
+            card_package = audit_and_improve(card_package, model, min_upload_score, max_rewrites)
+            progress.progress(85)
+            status.info("4/4 저장 중")
+            card_package["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            card_package["reference_preview"] = reference_text[:300]
+            card_package.setdefault("auto_brief", {}).setdefault("image_ratio", image_ratio)
+            st.session_state.current_package = card_package
+            save_history_item(card_package)
+            st.session_state.history_meta = load_history_meta(HISTORY_LIMIT)
+            progress.progress(100)
+            if is_upload_ready(card_package, min_upload_score):
+                status.success("업로드 가능 기준을 통과한 카드뉴스 원고를 생성했습니다. 컨펌 후 제작 확장으로 넘어가세요.")
+            else:
+                status.warning("자동 개선 후에도 업로드 기준을 통과하지 못했습니다. 개선 방향을 직접 입력해 재작성하세요.")
+
+    with right:
+        st.subheader("결과")
+        if not st.session_state.current_package:
+            st.info("리서치 후 카드뉴스 원고를 생성하면 여기에 표시됩니다.")
+        else:
+            render_card_package(st.session_state.current_package, min_upload_score)
+
+elif menu == "제작 확장":
+    st.subheader("Step 3. 컨펌된 카드뉴스를 제작물로 확장")
+    approved = st.session_state.approved_package
+    if not approved:
+        st.warning("먼저 카드뉴스 기획 메뉴에서 업로드 가능 원고를 컨펌해주세요.")
+    else:
+        col_a, col_b = st.columns([0.8, 1.2], gap="large")
+        with col_a:
+            make_images = st.checkbox("카드뉴스 이미지화 기준/프롬프트 생성", value=True)
+            make_shorts = st.checkbox("1분 쇼츠 대본 + 영상화 프롬프트 생성", value=True)
+            make_longform = st.checkbox("롱폼용 대본 생성", value=False)
+            make_titles = st.checkbox("제목/썸네일/해시태그 생성", value=True)
+            visual_style = st.text_input("이미지 스타일 기준", value="clean editorial card news, high readability, controlled contrast")
+            video_style = st.text_input("쇼츠 영상 스타일 기준", value="fast-paced editorial short-form, clear visual beats")
+            longform_minutes = st.slider("롱폼 분량", 3, 20, 8, 1)
+            expand_button = st.button("선택한 제작물 생성", type="primary", use_container_width=True)
+        with col_b:
+            render_card_package(approved, min_upload_score)
+        if expand_button:
+            options = {"make_images":make_images, "make_shorts":make_shorts, "make_longform":make_longform, "make_titles":make_titles, "visual_style":visual_style, "video_style":video_style, "longform_minutes":longform_minutes, "image_ratio":image_ratio}
+            with st.spinner("컨펌된 카드뉴스를 기준으로 제작물을 확장 중입니다."):
+                expansion = call_llm(EXPAND_SYSTEM, build_expand_prompt(clean_card_package(approved), options), model, min(1.0, temperature + 0.05))
+                expanded = clean_card_package(dict(approved))
+                expanded["status"] = "expanded"
+                expanded["expanded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                expanded["expansion_options"] = options
+                expanded["expansion"] = expansion
+                st.session_state.approved_package = expanded
+                st.session_state.current_package = expanded
+                save_history_item(expanded)
+                st.session_state.history_meta = load_history_meta(HISTORY_LIMIT)
+                st.success("제작 확장 완료.")
+                render_card_package(expanded, min_upload_score)
+else:
+    render_history()
