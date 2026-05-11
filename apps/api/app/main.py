@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.analysis import build_stub_analysis, build_stub_shorts_script
@@ -14,6 +15,14 @@ from app.models import CollectedPost, PostMetricSnapshot, Script, Source, StoryA
 from app.schemas import CollectSourceResult, SourceCreate, SourceRead, StoryCardRead
 
 app = FastAPI(title=settings.app_name)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -93,6 +102,27 @@ def list_stories(db: Annotated[Session, Depends(get_db)], limit: int = 50):
         .all()
     )
     return [_story_card(post) for post in posts]
+
+
+@app.get("/dashboard/summary")
+def dashboard_summary(db: Annotated[Session, Depends(get_db)]):
+    total_sources = db.scalar(select(func.count(Source.id))) or 0
+    active_sources = db.scalar(select(func.count(Source.id)).where(Source.is_active.is_(True))) or 0
+    total_stories = db.scalar(select(func.count(CollectedPost.id))) or 0
+    total_snapshots = db.scalar(select(func.count(PostMetricSnapshot.id))) or 0
+    scripted_stories = db.scalar(select(func.count(CollectedPost.id)).where(CollectedPost.status == StoryStatus.scripted)) or 0
+    analyzed_stories = db.scalar(select(func.count(CollectedPost.id)).where(CollectedPost.status == StoryStatus.analyzed)) or 0
+    avg_viral_score = db.scalar(select(func.avg(StoryScore.viral_score))) or 0
+
+    return {
+        "total_sources": total_sources,
+        "active_sources": active_sources,
+        "total_stories": total_stories,
+        "total_snapshots": total_snapshots,
+        "analyzed_stories": analyzed_stories,
+        "scripted_stories": scripted_stories,
+        "avg_viral_score": round(float(avg_viral_score), 2),
+    }
 
 
 @app.post("/stories/{post_id}/analyze")
