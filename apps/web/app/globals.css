@@ -1,0 +1,32 @@
+:root {
+  color-scheme: dark;
+  --bg: #080713;
+  --panel: #121026;
+  --panel-soft: #1a1733;
+  --text: #f5f3ff;
+  --muted: #a7a1c5;
+  --line: rgba(255, 255, 255, 0.1);
+  --accent: #8b5cf6;
+  --teal: #2dd4bf;
+  --danger: #fb7185;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top left, rgba(139, 92, 246, 0.25), transparent 30%), var(--bg);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+a {
+  color: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
