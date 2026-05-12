@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from hashlib import sha256
 from math import log10
 from typing import Optional
 
 import feedparser
-import pandas as pd
 import streamlit as st
 from dateutil import parser as date_parser
 
@@ -188,18 +186,19 @@ for item in stories:
         }
     )
 
-df = pd.DataFrame(rows).sort_values("viral_score", ascending=False)
+rows = sorted(rows, key=lambda row: row["viral_score"], reverse=True)
 
 st.subheader("Story Radar")
 st.dataframe(
-    df[["viral_score", "debate_score", "rank", "source", "angle", "title", "url"]],
+    rows,
     use_container_width=True,
     hide_index=True,
+    column_order=["viral_score", "debate_score", "rank", "source", "angle", "title", "url"],
 )
 
 st.subheader("소재 상세 / 대본 초안")
-selected_title = st.selectbox("소재 선택", df["title"].tolist())
-selected = df[df["title"] == selected_title].iloc[0]
+selected_title = st.selectbox("소재 선택", [row["title"] for row in rows])
+selected = next(row for row in rows if row["title"] == selected_title)
 
 left, right = st.columns([1, 1])
 with left:
