@@ -6,6 +6,7 @@ import runpy
 import streamlit as st
 
 APP_SUBTITLE = "상시 디렉션 입력 · 추론 설계도 · 리서치 출처 · 카드뉴스 컨펌 후 확장"
+HISTORY_LIMIT = 20
 
 # If the user changes to the expansion menu after generation, Streamlit keeps
 # current in session_state, but the original V10 only checks approved. Promote
@@ -29,5 +30,5 @@ st.button = _button_with_manual_confirm
 
 runpy.run_path(
     os.path.join(os.path.dirname(__file__), "pd_app_pipeline_v10.py"),
-    init_globals={"APP_SUBTITLE": APP_SUBTITLE, "csv": csv, "io": io},
+    init_globals={"APP_SUBTITLE": APP_SUBTITLE, "HISTORY_LIMIT": HISTORY_LIMIT, "csv": csv, "io": io},
 )
