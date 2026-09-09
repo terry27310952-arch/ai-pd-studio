@@ -1,0 +1,36 @@
+name: ICT11 v1.2 cinematic build
+on:
+  push:
+    branches:
+      - chatgpt/ict11-v12-cinematic-build
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build offline browser film
+        run: python tools/ict11_v12/build.py
+      - name: Inspect package
+        run: |
+          ls -lh dist
+          python - <<'PY'
+          import zipfile, pathlib
+          p=pathlib.Path('dist/KIYOSAKI_ICT11_WEB_v1_2_PERSISTENT_MARKET_FILM_DIRECT.zip')
+          with zipfile.ZipFile(p) as z:
+              bad=z.testzip()
+              print('zip_test=', bad)
+              print('\n'.join(z.namelist()))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KIYOSAKI_ICT11_WEB_v1_2_PERSISTENT_MARKET_FILM_DIRECT
+          path: dist/KIYOSAKI_ICT11_WEB_v1_2_PERSISTENT_MARKET_FILM_DIRECT.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
